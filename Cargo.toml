@@ -1,0 +1,17 @@
+[package]
+name = "labdoo-installer"
+version = "0.1.0"
+edition = "2021"
+description = "Labdoo Labtix installer TUI (Ratatui port of exec.sh) — clone Clonezilla images to target disks with shred, hostname and content setup"
+license = "GPL-3.0-or-later"
+rust-version = "1.74"
+
+[[bin]]
+name = "labdoo-installer"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
