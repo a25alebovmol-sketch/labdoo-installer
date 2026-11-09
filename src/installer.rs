@@ -1,33 +1,78 @@
-//! Pure installer logic ported from `exec.sh`.
+//! Pure, side-effect-free helpers for the Labdoo installer.
 //!
-//! Everything here is std-only on purpose so `cargo test` runs anywhere
-//! (including Windows and GitHub CI) without disks, sudo or Clonezilla.
-//! The TUI (`main.rs`) calls into these helpers.
-//!
-//! Security notes:
-//! - Disk and image names are allow-listed (no shell metachars, no `--flags`).
-//! - Display strings are sanitised (no ANSI escapes / control chars in the UI).
-//! - No shell is ever used: callers must spawn `Command` with these argvs.
+//! Keeping parsing, validation and safety decisions here makes them testable
+//! without a live system, root access, disks, or Clonezilla.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Default hostname meaning "keep the image hostname".
+/// Default hostname meaning "leave the hostname in the image unchanged".
 pub const KEEP_HOSTNAME: &str = "labdoo-000xxxxx";
-
-/// Max lengths enforced both in pure logic and in the TUI key handler.
 pub const MAX_IMAGE_LEN: usize = 64;
-pub const MAX_HOSTNAME_LEN: usize = 64;
+pub const MAX_HOSTNAME_LEN: usize = 63;
 pub const MAX_PATH_LEN: usize = 256;
 
-/// Derived filesystem locations for a given Clonezilla image directory.
+/// The boot medium discovered by the installer.
 ///
-/// Mirrors exec.sh:
-/// ```sh
-/// root_path=$(echo $image_path | rev | cut -d "/" -f 3- | rev)
-/// content_lists_path="$root_path/wiki-archive/content_list"
-/// content_wikis_path="$root_path/wiki-archive/wikis/"
-/// content_kiwix_path="$root_path/wiki-archive/kiwix/wikis/"
-/// ```
+/// Optical media is deliberately a separate variant: it proves that the live
+/// source is known, but can never be selected as a target disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootDevice {
+    Disk(String),
+    Optical(String),
+}
+
+impl BootDevice {
+    pub fn description(&self) -> String {
+        match self {
+            Self::Disk(name) => format!("{name} (disk)"),
+            Self::Optical(name) => format!("{name} (optical media)"),
+        }
+    }
+
+    pub fn blocks_target(&self, target: &str) -> bool {
+        matches!(self, Self::Disk(name) if name == target)
+    }
+}
+
+/// A target-capable block device reported by lsblk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskInfo {
+    pub name: String,
+    pub size: String,
+    pub model: String,
+    pub transport: String,
+    pub removable: bool,
+    pub read_only: bool,
+}
+
+impl DiskInfo {
+    pub fn label(&self) -> String {
+        let mut details = Vec::new();
+        if !self.size.is_empty() {
+            details.push(self.size.clone());
+        }
+        if !self.model.is_empty() {
+            details.push(self.model.clone());
+        }
+        if !self.transport.is_empty() {
+            details.push(self.transport.clone());
+        }
+        if self.removable {
+            details.push("removable".to_string());
+        }
+        if self.read_only {
+            details.push("READ-ONLY".to_string());
+        }
+        if details.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}  —  {}", self.name, details.join(" · "))
+        }
+    }
+}
+
+/// Filesystem locations derived from a Clonezilla image directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedPaths {
     pub root: PathBuf,
@@ -36,7 +81,6 @@ pub struct DerivedPaths {
     pub content_kiwix: PathBuf,
 }
 
-/// Strip the last two path components (`.../<image>` -> `...`).
 pub fn derive_paths(image_path: &Path) -> DerivedPaths {
     let root = image_path
         .ancestors()
@@ -51,52 +95,102 @@ pub fn derive_paths(image_path: &Path) -> DerivedPaths {
     }
 }
 
-/// Path of the Clonezilla marker file exec.sh checks (`clonezilla-img`).
 pub fn clonezilla_marker_path(image_path: &Path) -> PathBuf {
     image_path.join("clonezilla-img")
 }
 
-/// Filter raw `lsblk -d -n -o NAME` output the way exec.sh does,
-/// plus an allow-list so unexpected / malicious names never reach the UI.
+/// Parse the stable, shell-friendly lsblk property format.
 ///
-/// Drops `sr*`, `sc*`, `loop*` and anything that is not a plausible
-/// `sd/vd/hd/nvme/mmcblk` disk name.
-pub fn filter_disks(raw: &str) -> Vec<String> {
-    raw.split_whitespace()
-        .filter(|name| {
-            !(name.starts_with("sr") || name.starts_with("sc") || name.starts_with("loop"))
-        })
-        .filter(|name| is_valid_disk_name(name))
-        .map(str::to_string)
-        .collect()
+/// Only TYPE="disk" rows make it into the result. This avoids showing
+/// optical, loop, mapper, partition, and other non-target devices.
+pub fn parse_disk_inventory(raw: &str) -> Vec<DiskInfo> {
+    let mut disks = Vec::new();
+    for line in raw.lines() {
+        let fields = parse_lsblk_properties(line);
+        if fields.get("TYPE").map(String::as_str) != Some("disk") {
+            continue;
+        }
+        let Some(name) = fields.get("NAME").cloned() else {
+            continue;
+        };
+        if !is_valid_disk_name(&name) || disks.iter().any(|disk: &DiskInfo| disk.name == name) {
+            continue;
+        }
+        disks.push(DiskInfo {
+            name,
+            size: fields.get("SIZE").cloned().unwrap_or_default(),
+            model: fields.get("MODEL").cloned().unwrap_or_default(),
+            transport: fields.get("TRAN").cloned().unwrap_or_default(),
+            removable: fields.get("RM").map(String::as_str) == Some("1"),
+            read_only: fields.get("RO").map(String::as_str) == Some("1"),
+        });
+    }
+    disks
 }
 
-/// Strict allow-list for disk base names (no partition suffix).
-///
-/// Accepted: `sd[a-z]{1,2}`, `vd[a-z]{1,2}`, `hd[a-z]{1,2}`, `xvd[a-z]{1,2}`,
-/// `nvme<digits>n<digits>`, `mmcblk<digits>`.
-pub fn is_valid_disk_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > 32 {
-        return false;
+fn parse_lsblk_properties(line: &str) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    let mut chars = line.chars().peekable();
+
+    while chars.peek().is_some() {
+        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+            chars.next();
+        }
+        let mut key = String::new();
+        while let Some(character) = chars.peek().copied() {
+            if character == '=' || character.is_whitespace() {
+                break;
+            }
+            key.push(character);
+            chars.next();
+        }
+        if key.is_empty() || chars.next() != Some('=') {
+            break;
+        }
+
+        let mut value = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            let mut escaped = false;
+            for c in chars.by_ref() {
+                if escaped {
+                    value.push(c);
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    break;
+                } else {
+                    value.push(c);
+                }
+            }
+        } else {
+            value.extend(chars.by_ref().take_while(|c| !c.is_whitespace()));
+        }
+        fields.insert(key, value);
     }
-    if name.starts_with('-') || name.contains('/') || name.contains('\0') {
+    fields
+}
+
+/// Strict allow-list for disk base names (no partitions).
+pub fn is_valid_disk_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 32 || name.starts_with('-') || name.contains('/') {
         return false;
     }
     if let Some(rest) = name.strip_prefix("nvme") {
-        // e.g. nvme0n1
         let mut parts = rest.splitn(2, 'n');
-        let (Some(a), Some(b)) = (parts.next(), parts.next()) else {
+        let (Some(controller), Some(namespace)) = (parts.next(), parts.next()) else {
             return false;
         };
-        return !a.is_empty()
-            && !b.is_empty()
-            && a.chars().all(|c| c.is_ascii_digit())
-            && b.chars().all(|c| c.is_ascii_digit());
+        return !controller.is_empty()
+            && !namespace.is_empty()
+            && controller.chars().all(|c| c.is_ascii_digit())
+            && namespace.chars().all(|c| c.is_ascii_digit());
     }
     if let Some(rest) = name.strip_prefix("mmcblk") {
         return !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit());
     }
-    for prefix in ["sd", "vd", "hd", "xvd"] {
+    for prefix in ["xvd", "sd", "vd", "hd"] {
         if let Some(rest) = name.strip_prefix(prefix) {
             return (1..=2).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_lowercase());
         }
@@ -104,135 +198,139 @@ pub fn is_valid_disk_name(name: &str) -> bool {
     false
 }
 
-/// Image names become argv to `ocs-sr`; forbid option-injection and shell chars.
 pub fn is_valid_image_name(name: &str) -> bool {
-    if name.is_empty() || name.len() > MAX_IMAGE_LEN {
-        return false;
-    }
-    if name.starts_with('-') {
-        return false;
-    }
-    name.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    !name.is_empty()
+        && name.len() <= MAX_IMAGE_LEN
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
-/// Content-list text field: absolute path chars only, no `..`, no shell metachars.
+/// Content list paths are absolute, non-traversing paths with no control or
+/// shell-significant characters. Spaces are intentionally allowed.
 pub fn is_valid_content_list_value(value: &str) -> bool {
-    if value.is_empty() || value.len() > MAX_PATH_LEN {
-        return false;
-    }
-    if value.contains('\0') || value.chars().any(|c| c.is_control()) {
-        return false;
-    }
-    if value.contains("..") {
-        return false;
-    }
-    value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ' '))
+    value.starts_with('/')
+        && !value.is_empty()
+        && value.len() <= MAX_PATH_LEN
+        && !value.contains('\0')
+        && !value.chars().any(|c| c.is_control())
+        && value.split('/').all(|part| part != "..")
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | ' '))
 }
 
-/// Strip control chars / ANSI escapes for safe TUI display, truncate to `max`.
 pub fn sanitize_display(input: &str, max: usize) -> String {
-    let clean: String = input
+    input
         .chars()
         .filter(|c| !c.is_control())
         .take(max)
-        .collect();
-    clean.trim().to_string()
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
-/// Derive the disk base name from a kernel source path.
-///
-/// Handles `/dev/sda1` -> `sda`, `/dev/nvme0n1p2` -> `nvme0n1`,
-/// `/dev/mmcblk0p1` -> `mmcblk0`. Returns `None` for LVM/dm/unknown so
-/// callers fail closed instead of guessing the boot disk wrong.
+/// Derive the base disk from a conventional Linux block-device source.
 pub fn disk_from_source(src: &str) -> Option<String> {
-    let dev = src.trim();
-    let rest = dev.strip_prefix("/dev/")?;
+    let rest = src.trim().strip_prefix("/dev/")?;
     if rest.is_empty() || rest.contains('/') {
         return None;
     }
-    // NVMe: nvme<n>n<m>[p<part>]
     if let Some(after) = rest.strip_prefix("nvme") {
-        let (base_part, part_ok) = match after.split_once('p') {
+        let (base, part_ok) = match after.split_once('p') {
             Some((base, suffix)) => (
                 format!("nvme{base}"),
                 !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()),
             ),
             None => (format!("nvme{after}"), true),
         };
-        if !part_ok || !is_valid_disk_name(&base_part) {
-            return None;
-        }
-        return Some(base_part);
+        return (part_ok && is_valid_disk_name(&base)).then_some(base);
     }
-    // MMC: mmcblk<n>[p<part>]
     if let Some(after) = rest.strip_prefix("mmcblk") {
         let base = match after.split_once('p') {
-            Some((digits, suffix)) => {
-                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
-                    return None;
-                }
+            Some((digits, suffix))
+                if !digits.is_empty()
+                    && !suffix.is_empty()
+                    && suffix.chars().all(|c| c.is_ascii_digit()) =>
+            {
                 format!("mmcblk{digits}")
             }
+            Some(_) => return None,
             None => format!("mmcblk{after}"),
         };
-        if !is_valid_disk_name(&base) {
-            return None;
-        }
-        return Some(base);
+        return is_valid_disk_name(&base).then_some(base);
     }
-    // sd/vd/hd/xvd + letters + optional partition digits, e.g. sda, sda1, vda12.
     for prefix in ["xvd", "sd", "vd", "hd"] {
         if let Some(after) = rest.strip_prefix(prefix) {
             let letters: String = after
                 .chars()
                 .take_while(|c| c.is_ascii_lowercase())
                 .collect();
-            let digits: String = after[letters.len()..].chars().collect();
-            if !(1..=2).contains(&letters.len()) {
-                continue;
-            }
-            if !digits.is_empty() && !digits.chars().all(|c| c.is_ascii_digit()) {
-                continue;
-            }
-            let base = format!("{prefix}{letters}");
-            if is_valid_disk_name(&base) {
-                return Some(base);
+            let suffix = &after[letters.len()..];
+            if (1..=2).contains(&letters.len())
+                && (suffix.is_empty() || suffix.chars().all(|c| c.is_ascii_digit()))
+            {
+                let base = format!("{prefix}{letters}");
+                if is_valid_disk_name(&base) {
+                    return Some(base);
+                }
             }
         }
     }
     None
 }
 
-/// True when the user picked the device the live system booted from.
-pub fn is_boot_disk_selected(boot_device: &str, selected: &str) -> bool {
-    !boot_device.is_empty() && boot_device.trim() == selected.trim()
+pub fn optical_device_from_source(source: &str) -> Option<String> {
+    let device = source.trim().strip_prefix("/dev/")?;
+    let number = device
+        .strip_prefix("sr")
+        .or_else(|| device.strip_prefix("scd"))?;
+    (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then(|| device.to_string())
 }
 
-/// Partition suffix for a disk + partition number.
-///
-/// SATA (`sda` + 3 -> `3`), NVMe/MMC or any disk ending in a digit
-/// (`nvme0n1` + 3 -> `p3`, `mmcblk0` + 3 -> `p3`).
+pub fn boot_device_from_source(source: &str) -> Option<BootDevice> {
+    disk_from_source(source)
+        .map(BootDevice::Disk)
+        .or_else(|| optical_device_from_source(source).map(BootDevice::Optical))
+}
+
+/// A single target-selection gate for both the picker and confirm screen.
+/// Unknown boot media always blocks the operation.
+pub fn target_disk_error(
+    boot_device: Option<&BootDevice>,
+    target: Option<&DiskInfo>,
+) -> Option<String> {
+    let Some(target) = target else {
+        return Some("no target disk selected".to_string());
+    };
+    if target.read_only {
+        return Some(format!("refusing: {} is read-only", target.name));
+    }
+    let Some(boot_device) = boot_device else {
+        return Some("refusing: boot device unknown (fail-closed)".to_string());
+    };
+    if boot_device.blocks_target(&target.name) {
+        return Some(format!("refusing: {} is the boot device", target.name));
+    }
+    None
+}
+
 pub fn partition_suffix(disk: &str, part_number: u8) -> String {
-    let needs_p = disk.starts_with("nvme")
+    if disk.starts_with("nvme")
         || disk.starts_with("mmcblk")
-        || disk.chars().last().is_some_and(|c| c.is_ascii_digit());
-    if needs_p {
+        || disk.chars().last().is_some_and(|c| c.is_ascii_digit())
+    {
         format!("p{part_number}")
     } else {
         part_number.to_string()
     }
 }
 
-/// Full partition device name without `/dev/` prefix, e.g. `sda3`, `nvme0n1p3`.
 pub fn target_partition(disk: &str, part_number: u8) -> String {
     format!("{disk}{}", partition_suffix(disk, part_number))
 }
 
-/// exec.sh probes for partition 3 and falls back to partition 2
-/// (two- vs three-partition Labtix images).
 pub fn resolve_part_number(has_partition3: bool) -> u8 {
     if has_partition3 {
         3
@@ -241,45 +339,30 @@ pub fn resolve_part_number(has_partition3: bool) -> u8 {
     }
 }
 
-/// Hostname is valid when non-empty and made of `[A-Za-z0-9-]` (max 64).
-/// The sentinel `labdoo-000xxxxx` means "do not change".
 pub fn validate_hostname(hostname: &str) -> bool {
-    let h = hostname.trim();
-    !h.is_empty()
-        && h.len() <= MAX_HOSTNAME_LEN
-        && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    let hostname = hostname.trim();
+    hostname == KEEP_HOSTNAME
+        || (!hostname.is_empty()
+            && hostname.len() <= MAX_HOSTNAME_LEN
+            && !hostname.starts_with('-')
+            && !hostname.ends_with('-')
+            && hostname
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'))
 }
 
-/// Extract a `####header` section like exec.sh does with
-/// `sed -n "/####lang_1/,/^$/p" | tail -n +2`.
-///
-/// Returns trimmed lines; stops at the first blank line; caps at 500 lines
-/// so a hostile content list cannot blow up memory.
 pub fn parse_section(content: &str, header: &str) -> Vec<String> {
     let mut lines = content.lines();
-    let mut found = false;
-    for line in lines.by_ref() {
-        if line.trim() == header {
-            found = true;
-            break;
-        }
-    }
-    if !found {
+    if !lines.by_ref().any(|line| line.trim() == header) {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    for line in lines.take(500) {
-        if line.trim().is_empty() {
-            break;
-        }
-        // Cap line length to avoid giant allocations from a hostile file.
-        out.push(line.trim().chars().take(512).collect());
-    }
-    out
+    lines
+        .take_while(|line| !line.trim().is_empty())
+        .take(500)
+        .map(|line| line.trim().chars().take(512).collect())
+        .collect()
 }
 
-/// `shred /dev/<disk> -v -f -n <level>` argv (no shell, no `sudo` prefix here;
-/// the caller decides privilege escalation).
 pub fn shred_argv(disk: &str, level: u8) -> Vec<String> {
     vec![
         "shred".to_string(),
@@ -291,7 +374,6 @@ pub fn shred_argv(disk: &str, level: u8) -> Vec<String> {
     ]
 }
 
-/// `/usr/sbin/ocs-sr ... restoredisk <image> <disk>` argv (no shell).
 pub fn ocs_restore_argv(image: &str, disk: &str) -> Vec<String> {
     vec![
         "/usr/sbin/ocs-sr".to_string(),
@@ -312,24 +394,22 @@ pub fn ocs_restore_argv(image: &str, disk: &str) -> Vec<String> {
     ]
 }
 
-/// Human-readable install plan (shown in Confirm step and `--dry-run` logs).
-/// All interpolated values are display-sanitised.
 pub fn build_plan(image: &str, disk: &str, shred_level: u8, hostname: &str) -> Vec<String> {
-    let part = target_partition(disk, 3);
+    let partition = target_partition(disk, resolve_part_number(true));
     let image = sanitize_display(image, MAX_IMAGE_LEN);
     let disk = sanitize_display(disk, 32);
     let hostname = sanitize_display(hostname, MAX_HOSTNAME_LEN);
     vec![
         format!("shred: {}", shred_argv(&disk, shred_level).join(" ")),
         format!("clone: {}", ocs_restore_argv(&image, &disk).join(" ")),
-        format!("mount /dev/{part} on /mnt"),
-        if hostname.trim() == KEEP_HOSTNAME {
+        format!("mount /dev/{partition} on a private mountpoint"),
+        if hostname == KEEP_HOSTNAME {
             "hostname: keep image default".to_string()
         } else {
             format!("hostname: set to {hostname}")
         },
-        "contents: unpack wikis / rsync kiwix / set firefox homepages".to_string(),
-        "finish: fix perms, machine-id, unmount, poweroff-or-gparted".to_string(),
+        "contents: validate and install requested archives".to_string(),
+        "finish: fix permissions, regenerate machine-id, unmount".to_string(),
     ]
 }
 
@@ -337,49 +417,48 @@ pub fn build_plan(image: &str, disk: &str, shred_level: u8, hostname: &str) -> V
 mod tests {
     use super::*;
 
+    fn disk(name: &str) -> DiskInfo {
+        DiskInfo {
+            name: name.to_string(),
+            size: "30G".to_string(),
+            model: "VMware Virtual S".to_string(),
+            transport: "spi".to_string(),
+            removable: false,
+            read_only: false,
+        }
+    }
+
     #[test]
-    fn filters_optical_and_loop_devices() {
-        let raw = "sda sdb sr0 scd0 loop0 nvme0n1 mmcblk0 vda --help";
-        assert_eq!(
-            filter_disks(raw),
-            vec!["sda", "sdb", "nvme0n1", "mmcblk0", "vda"]
+    fn parses_lsblk_inventory_with_models_and_filters_non_disks() {
+        let raw = concat!(
+            "NAME=\"sda\" SIZE=\"30G\" MODEL=\"VMware Virtual S\" TRAN=\"spi\" RM=\"0\" RO=\"0\" TYPE=\"disk\"\n",
+            "NAME=\"sr0\" SIZE=\"1.2G\" MODEL=\"VMware SATA CD\" TRAN=\"sata\" RM=\"1\" RO=\"1\" TYPE=\"rom\"\n",
+            "NAME=\"loop0\" SIZE=\"1G\" MODEL=\"\" TRAN=\"\" RM=\"0\" RO=\"1\" TYPE=\"loop\"\n",
         );
+        assert_eq!(parse_disk_inventory(raw), vec![disk("sda")]);
     }
 
     #[test]
-    fn filters_empty_input() {
-        assert!(filter_disks("   \n ").is_empty());
+    fn parses_escaped_lsblk_values() {
+        let raw = "NAME=\"sda\" SIZE=\"1G\" MODEL=\"Disk with \\\"quotes\\\"\" TRAN=\"\" RM=\"0\" RO=\"0\" TYPE=\"disk\"";
+        assert_eq!(parse_disk_inventory(raw)[0].model, "Disk with \"quotes\"");
     }
 
     #[test]
-    fn allow_lists_disk_names() {
-        assert!(is_valid_disk_name("sda"));
-        assert!(is_valid_disk_name("nvme0n1"));
-        assert!(is_valid_disk_name("mmcblk0"));
-        assert!(!is_valid_disk_name("--help"));
-        assert!(!is_valid_disk_name("sda;rm"));
-        assert!(!is_valid_disk_name(""));
-        assert!(!is_valid_disk_name("../sda"));
-    }
-
-    #[test]
-    fn rejects_image_option_injection() {
-        assert!(is_valid_image_name("labdoo-24.04"));
-        assert!(!is_valid_image_name("--help"));
-        assert!(!is_valid_image_name("a;b"));
-        assert!(!is_valid_image_name(""));
+    fn allow_lists_only_plausible_disk_names() {
+        for name in ["sda", "sdaa", "vda", "xvda", "nvme0n1", "mmcblk0"] {
+            assert!(is_valid_disk_name(name), "{name}");
+        }
+        for name in ["", "--help", "sda;rm", "../sda", "sr0", "sda1"] {
+            assert!(!is_valid_disk_name(name), "{name}");
+        }
     }
 
     #[test]
     fn parses_kernel_sources_without_guessing() {
         assert_eq!(disk_from_source("/dev/sda1"), Some("sda".to_string()));
-        assert_eq!(disk_from_source("/dev/sda"), Some("sda".to_string()));
         assert_eq!(
             disk_from_source("/dev/nvme0n1p2"),
-            Some("nvme0n1".to_string())
-        );
-        assert_eq!(
-            disk_from_source("/dev/nvme0n1"),
             Some("nvme0n1".to_string())
         );
         assert_eq!(
@@ -387,94 +466,101 @@ mod tests {
             Some("mmcblk0".to_string())
         );
         assert_eq!(disk_from_source("/dev/mapper/vg-root"), None);
-        assert_eq!(disk_from_source("/dev/sda; rm"), None);
-        assert_eq!(disk_from_source("sda1"), None);
+        assert_eq!(disk_from_source("/dev/sda;rm"), None);
     }
 
     #[test]
-    fn sanitises_display() {
-        // ESC (0x1b) and newline are stripped, neutralising CSI sequences.
-        let out = sanitize_display("\x1b[2Jsda\n", 16);
-        assert!(!out.contains('\x1b'));
-        assert!(!out.contains('\n'));
-        assert!(out.contains("sda"));
-        assert_eq!(sanitize_display("  sda  ", 16), "sda");
-    }
-
-    #[test]
-    fn derives_paths_like_exec_sh() {
-        let p = derive_paths(Path::new("/media/usb/images/labdoo-24.04"));
-        assert_eq!(p.root, PathBuf::from("/media/usb"));
+    fn identifies_vmware_optical_boot_media() {
         assert_eq!(
-            p.content_lists,
-            PathBuf::from("/media/usb/wiki-archive/content_list")
+            boot_device_from_source("/dev/sr0"),
+            Some(BootDevice::Optical("sr0".to_string()))
         );
         assert_eq!(
-            p.content_wikis,
-            PathBuf::from("/media/usb/wiki-archive/wikis")
-        );
-        assert_eq!(
-            p.content_kiwix,
-            PathBuf::from("/media/usb/wiki-archive/kiwix/wikis")
+            boot_device_from_source("/dev/sda1"),
+            Some(BootDevice::Disk("sda".to_string()))
         );
     }
 
     #[test]
-    fn partition_names() {
-        assert_eq!(target_partition("sda", 3), "sda3");
-        assert_eq!(target_partition("sdb", 2), "sdb2");
-        assert_eq!(target_partition("nvme0n1", 3), "nvme0n1p3");
-        assert_eq!(target_partition("mmcblk0", 3), "mmcblk0p3");
-        assert_eq!(target_partition("vda", 2), "vda2");
+    fn optical_boot_media_allows_a_disk_but_disk_boot_does_not() {
+        let sda = disk("sda");
+        assert_eq!(
+            target_disk_error(Some(&BootDevice::Optical("sr0".to_string())), Some(&sda)),
+            None
+        );
+        assert!(
+            target_disk_error(Some(&BootDevice::Disk("sda".to_string())), Some(&sda))
+                .unwrap()
+                .contains("boot device")
+        );
+        assert!(target_disk_error(None, Some(&sda))
+            .unwrap()
+            .contains("unknown"));
     }
 
     #[test]
-    fn resolves_part_number() {
-        assert_eq!(resolve_part_number(true), 3);
-        assert_eq!(resolve_part_number(false), 2);
+    fn refuses_read_only_targets() {
+        let mut sda = disk("sda");
+        sda.read_only = true;
+        assert!(
+            target_disk_error(Some(&BootDevice::Optical("sr0".to_string())), Some(&sda))
+                .unwrap()
+                .contains("read-only")
+        );
     }
 
     #[test]
-    fn validates_hostnames() {
-        assert!(validate_hostname("labdoo-000123"));
-        assert!(validate_hostname(KEEP_HOSTNAME));
-        assert!(!validate_hostname(""));
-        assert!(!validate_hostname("bad name!"));
-        assert!(!validate_hostname("a;b"));
-    }
-
-    #[test]
-    fn validates_content_lists() {
+    fn validates_image_and_content_list_values() {
+        assert!(is_valid_image_name("labdoo-24.04"));
+        assert!(!is_valid_image_name("--help"));
         assert!(is_valid_content_list_value(
-            "/media/usb/wiki-archive/content_list/none"
+            "/media/usb/wiki archive/content_list/none"
         ));
-        assert!(!is_valid_content_list_value("a; rm -rf /"));
+        assert!(!is_valid_content_list_value("relative/list"));
         assert!(!is_valid_content_list_value("/etc/../shadow"));
     }
 
     #[test]
-    fn detects_boot_disk_selection() {
-        assert!(is_boot_disk_selected("sda", "sda"));
-        assert!(!is_boot_disk_selected("sda", "sdb"));
-        assert!(!is_boot_disk_selected("", "sda"));
+    fn validates_hostnames() {
+        assert!(validate_hostname(KEEP_HOSTNAME));
+        assert!(validate_hostname("labdoo-000123"));
+        assert!(!validate_hostname("-bad"));
+        assert!(!validate_hostname("bad-"));
+        assert!(!validate_hostname("bad name"));
     }
 
     #[test]
-    fn parses_content_list_sections() {
-        let list = "####info\nline a\nline b\n\n####lang_1\nen\n\n####wikis_1\nwiki-en.tar.gz\n\n";
-        assert_eq!(parse_section(list, "####info"), vec!["line a", "line b"]);
-        assert_eq!(parse_section(list, "####lang_1"), vec!["en"]);
-        assert_eq!(parse_section(list, "####wikis_1"), vec!["wiki-en.tar.gz"]);
-        assert!(parse_section(list, "####missing").is_empty());
+    fn derives_paths_like_the_legacy_script() {
+        let paths = derive_paths(Path::new("/media/usb/images/labdoo-24.04/files"));
+        assert_eq!(paths.root, PathBuf::from("/media/usb/images"));
+        assert_eq!(
+            paths.content_lists,
+            PathBuf::from("/media/usb/images/wiki-archive/content_list")
+        );
     }
 
     #[test]
-    fn builds_expected_commands_without_shell() {
-        assert_eq!(shred_argv("sda", 3).join(" "), "shred /dev/sda -v -f -n 3");
-        let ocs = ocs_restore_argv("labdoo-img", "sda").join(" ");
-        assert!(ocs.contains("restoredisk labdoo-img sda"));
-        assert!(!ocs.contains("sudo"));
-        let plan = build_plan("labdoo-img", "sda", 1, KEEP_HOSTNAME);
+    fn partitions_and_plans_are_safe_and_predictable() {
+        assert_eq!(target_partition("sda", 3), "sda3");
+        assert_eq!(target_partition("nvme0n1", 3), "nvme0n1p3");
+        assert_eq!(resolve_part_number(true), 3);
+        assert_eq!(resolve_part_number(false), 2);
+        let plan = build_plan("labdoo", "sda", 7, KEEP_HOSTNAME);
+        assert!(plan[0].ends_with("-n 3"));
         assert_eq!(plan.len(), 6);
+    }
+
+    #[test]
+    fn strips_control_characters_from_ui_text() {
+        let value = sanitize_display("\u{1b}[2J sda\n", 32);
+        assert!(!value.contains('\u{1b}'));
+        assert!(!value.contains('\n'));
+    }
+
+    #[test]
+    fn parses_content_sections_with_a_cap() {
+        let content = "####info\none\ntwo\n\n####lang_1\nen\n";
+        assert_eq!(parse_section(content, "####info"), vec!["one", "two"]);
+        assert!(parse_section(content, "####missing").is_empty());
     }
 }

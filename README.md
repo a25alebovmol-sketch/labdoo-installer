@@ -1,46 +1,73 @@
-# Labdoo Installer (Ratatui TUI)
+# Labdoo Installer 0.2
 
-Rust + [Ratatui](https://ratatui.rs) port of `exec.sh` — the Labdoo/Labtix
-Clonezilla installer that lived inside zzzFM/yad.
+This is a safer, inspection-focused refresh of the Ratatui Labdoo/Labtix
+installer. It is deliberately a **preflight release**: it validates the
+environment and produces an exact plan, but never erases or clones a disk.
 
-The original shell flow is preserved:
+That behaviour is intentional. The previous interface simulated progress when
+given the execute option and then displayed a successful installation even
+though no destructive command had been implemented. This release refuses that
+option instead of making that claim.
 
-1. Validate the Clonezilla image folder (`clonezilla-img` marker).
-2. List target disks via `lsblk`, refuse the boot device (`/live/config/boot-device`).
-3. Ask for shred passes (`0..3`), hostname, content-list file, poweroff flag.
-4. Show the info section from the content list.
-5. `shred` → `ocs-sr restoredisk` → mount `/dev/<disk><2|3>` (with `p` prefix
-   for `nvme*`/`mmcblk*`) → set hostname → unpack wikis / rsync kiwix /
-   set Firefox homepages → fix perms → fresh `machine-id` → unmount.
-6. Report missing/installed contents, then poweroff or open `gparted`.
+## What changed
+
+- Recognises a VMware ISO mounted as /dev/sr0 as known optical boot media.
+  That lets /dev/sda remain a valid VM target while still preventing a booted
+  USB/disk from being selected.
+- Checks the Labtix marker, several live-media mountpoints, and the normal
+  root mount before deciding that the boot device is unknown.
+- Does not invent target disks if lsblk fails.
+- Uses lsblk metadata to show disk name, size, model, transport, removable
+  status, and read-only status in the picker.
+- Refuses read-only targets and highlights removable media.
+- Keeps one target-selection safety gate for both the picker and confirmation
+  screen.
+- Supports refresh with r, which is useful after changing VMware hardware.
+- Requires the target name to be typed exactly before showing the plan.
+- Validates absolute content-list paths and stricter hostnames.
+- Correctly handles content-list paths that contain spaces.
+- Replaces the fake progress/success screen with an explicit reviewed plan.
+- Adds unit tests for VMware optical boot, metadata parsing, boot protection,
+  read-only disks, paths, command construction, and input validation.
+
+## Build and test
+
+    cargo fmt --check
+    cargo test
+    cargo clippy -- -D warnings
+    cargo build --release
 
 ## Run
 
-```bash
-cargo run -- --image labdoo-24.04 --image-path /media/usb/images/labdoo-24.04/files
-```
+    cargo run -- --image labdoo-24.04 --image-path /media/usb/images/labdoo-24.04/files
 
-Flags:
+Keys:
 
-- `--dry-run` (default `true`): simulate, log the exact `sudo …` commands.
-- `--execute`: actually run destructive commands. Linux + root + Clonezilla only.
+- Up/Down: choose a target disk
+- r: refresh block-device and boot-media detection
+- Tab: switch option fields
+- Left/Right: change shred passes
+- Space: toggle the future power-off preference
+- ? or h: show safety help
+- Esc: go back
+- q or Ctrl-C: quit
 
-Keys: `↑/↓` select disk · `Enter` next · `Tab` move field · `←/→` shred level ·
-type to edit · `Space` toggles poweroff · `Esc` back · `Ctrl-C` / `q` quit.
+## VMware behaviour
 
-## Layout
+With the common VMware layout:
 
-- `src/installer.rs` — pure, OS-independent logic (`cargo test` covers it).
-- `src/main.rs` — Ratatui + crossterm TUI, disk discovery, progress + log.
-- `exec.sh` — legacy yad implementation, kept as reference.
+| Device | Meaning |
+| --- | --- |
+| /dev/sr0 | ISO/CD used to boot Labtix |
+| /dev/sda | Virtual hard disk intended for the image |
 
-## CI
+The picker will show sr0 (optical media) as the known boot source and allow
+sda to proceed through preflight. It never treats sr0 as a target disk.
 
-`.github/workflows/ci.yml` runs on every push/PR to `main`:
+## Next implementation boundary
 
-`cargo fmt --check` → `cargo clippy -- -D warnings` → `cargo test` → `cargo build --release`.
-
-## Safety
-
-Destructive steps (`shred`, `ocs-sr`, `mount`, `chown`) never run unless you pass
-`--execute`. Review the Confirm screen / dry-run log first.
+An eventual real executor should be added only after a separate review of
+mount isolation, safe writes inside the mounted image, content-archive
+validation, cleanup on interruption, and reliable command-result reporting.
+It should run every external command as an argument vector rather than through
+a shell, and it must only report success after every stage has completed.
