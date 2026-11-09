@@ -3,19 +3,21 @@
 //! Flow (mirrors the shell script):
 //! 1. Pick target disk (never the boot device).
 //! 2. Set shred level, hostname, content list, poweroff flag.
-//! 3. Confirm the plan (`shred` + `ocs-sr restoredisk` + content setup).
+//! 3. Confirm by typing the disk name + marker check.
 //! 4. Install with live progress + log (dry-run by default).
 //!
-//! Destructive commands only run with `--execute` on Linux as root.
-//! Without it the app logs exactly what *would* run.
+//! Hardening: allow-listed disk/image names, no shell anywhere, absolute
+//! binary paths with a cleared env, boot-device fail-closed, marker check,
+//! display sanitising, input filtering, size caps, `--execute` gated to
+//! Linux + root + typed confirmation.
 
 mod installer;
 
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -23,8 +25,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use installer::{
-    build_plan, derive_paths, filter_disks, is_boot_disk_selected, parse_section,
-    resolve_part_number, target_partition, validate_hostname, KEEP_HOSTNAME,
+    build_plan, clonezilla_marker_path, derive_paths, disk_from_source, filter_disks,
+    is_boot_disk_selected, is_valid_content_list_value, is_valid_disk_name, is_valid_image_name,
+    parse_section, resolve_part_number, sanitize_display, target_partition, validate_hostname,
+    KEEP_HOSTNAME,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -47,13 +51,44 @@ struct Cli {
     /// Clonezilla image directory (fm_file in exec.sh)
     #[arg(long, default_value = "/home/partimag/labdoo-image")]
     image_path: PathBuf,
-    /// Simulate everything, run nothing destructive (default true)
+    /// Simulate everything (default true; kept for compat, `--execute` wins)
     #[arg(long, default_value_t = true)]
     dry_run: bool,
-    /// Actually execute shred / ocs-sr / mount (Linux + root only).
-    /// Without this flag the installer only simulates and logs commands.
+    /// Actually execute destructive steps (Linux + root + typed confirm only).
     #[arg(long, default_value_t = false)]
     execute: bool,
+}
+
+/// True only when destructive steps are allowed. Fail closed everywhere else.
+fn is_live_mode(cli: &Cli) -> bool {
+    cli.execute
+}
+
+struct App {
+    step: Step,
+    image: String,
+    image_path: PathBuf,
+    image_marker_ok: bool,
+    live: bool,
+
+    disks: Vec<String>,
+    boot_device: String,
+    boot_known: bool,
+    disk_state: ListState,
+    error: Option<String>,
+
+    field: usize,
+    shred_level: u8,
+    hostname: String,
+    content_list: String,
+    poweroff: bool,
+    confirm_input: String,
+
+    progress: f64,
+    progress_label: String,
+    logs: Vec<String>,
+    tick: u64,
+    done_ok: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,48 +117,26 @@ impl OptionField {
     ];
 }
 
-struct App {
-    step: Step,
-    image: String,
-    image_path: PathBuf,
-    dry_run: bool,
-    execute: bool,
-
-    disks: Vec<String>,
-    boot_device: String,
-    disk_state: ListState,
-    error: Option<String>,
-
-    field: usize,
-    shred_level: u8,
-    hostname: String,
-    content_list: String,
-    poweroff: bool,
-
-    progress: f64,
-    progress_label: String,
-    logs: Vec<String>,
-    tick: u64,
-    done_ok: bool,
-}
-
 impl App {
-    fn new(cli: &Cli, disks: Vec<String>, boot_device: String) -> Self {
+    fn new(cli: &Cli, disks: Vec<String>, boot_device: String, boot_known: bool) -> Self {
+        let image = sanitize_display(&cli.image, 64);
         let derived = derive_paths(&cli.image_path);
         let mut disk_state = ListState::default();
         if !disks.is_empty() {
-            // Pre-select the first non-boot disk when possible.
             let idx = disks.iter().position(|d| d != &boot_device).unwrap_or(0);
             disk_state.select(Some(idx));
         }
-        Self {
+        let live = is_live_mode(cli);
+        let marker_ok = clonezilla_marker_path(&cli.image_path).exists();
+        let mut app = Self {
             step: Step::PickDisk,
-            image: cli.image.clone(),
+            image,
             image_path: cli.image_path.clone(),
-            dry_run: cli.dry_run && !cli.execute,
-            execute: cli.execute,
+            image_marker_ok: marker_ok,
+            live,
             disks,
             boot_device,
+            boot_known,
             disk_state,
             error: None,
             field: 0,
@@ -135,16 +148,34 @@ impl App {
                 .to_string_lossy()
                 .into_owned(),
             poweroff: false,
+            confirm_input: String::new(),
             progress: 0.0,
             progress_label: "idle".to_string(),
-            logs: vec![format!(
-                "image '{}' from {}",
-                cli.image,
-                cli.image_path.display()
-            )],
+            logs: Vec::new(),
             tick: 0,
             done_ok: false,
+        };
+        if cli.dry_run && cli.execute {
+            app.log("note: --dry-run and --execute both given, --execute wins (LIVE)");
         }
+        app.log(format!(
+            "image '{}' from {} [{}]",
+            app.image,
+            app.image_path.display(),
+            if live { "LIVE" } else { "dry-run" }
+        ));
+        if live {
+            app.log("LIVE MODE: destructive commands allowed after typed confirmation");
+        } else {
+            app.log("dry-run: no destructive command will be executed");
+        }
+        if !marker_ok {
+            app.log("warning: clonezilla-img marker NOT found in image dir");
+        }
+        if !boot_known {
+            app.log("warning: boot device unknown, fail-closed guards are ON");
+        }
+        app
     }
 
     fn selected_disk(&self) -> Option<&str> {
@@ -159,27 +190,45 @@ impl App {
             .is_some_and(|d| is_boot_disk_selected(&self.boot_device, d))
     }
 
+    /// Fail-closed gate shared by PickDisk and Confirm.
+    fn disk_selection_error(&self) -> Option<String> {
+        let disk = self.selected_disk()?;
+        if !is_valid_disk_name(disk) {
+            return Some("refusing: disk name failed allow-list".to_string());
+        }
+        if !self.boot_known {
+            return Some("refusing: boot device unknown (fail-closed)".to_string());
+        }
+        if self.selected_is_boot() {
+            return Some(format!(
+                "refusing: {} is the boot device",
+                sanitize_display(disk, 32)
+            ));
+        }
+        None
+    }
+
     fn log(&mut self, line: impl Into<String>) {
-        self.logs.push(line.into());
+        // Never store control chars; logs are rendered verbatim in the TUI.
+        let clean = sanitize_display(&line.into(), 512);
+        self.logs.push(clean);
         if self.logs.len() > 200 {
             let excess = self.logs.len() - 200;
             self.logs.drain(..excess);
         }
     }
 
-    /// Simulated install stages shown with a progress bar.
-    /// With `--execute` the exact shell commands are also attempted
-    /// (best effort; failures are logged, never panic).
+    /// Install stages shown with a progress bar. Display-only strings built
+    /// from allow-listed values; real execution must use the argv helpers
+    /// with `Command` (no shell) — not implemented in this TUI demo.
     fn install_stages(&self) -> Vec<(String, f64, String)> {
         let disk = self.selected_disk().unwrap_or("sda").to_string();
-        // exec.sh probes for partition 3 (three-partition images) and falls
-        // back to 2 (two-partition images); assume 3 exists until probed.
         let part_number = resolve_part_number(true);
         let part = target_partition(&disk, part_number);
-        let shred = format!("sudo shred /dev/{disk} -v -f -n {}", self.shred_level);
+        let image = sanitize_display(&self.image, 64);
+        let shred = format!("shred /dev/{disk} -v -f -n {}", self.shred_level);
         let clone = format!(
-            "sudo /usr/sbin/ocs-sr -e1 auto -e2 -r -icrc -icds -scr -j2 -k1 -p true restoredisk {} {disk}",
-            self.image
+            "/usr/sbin/ocs-sr -e1 auto -e2 -r -icrc -icds -scr -j2 -k1 -p true restoredisk {image} {disk}"
         );
         vec![
             (
@@ -192,12 +241,15 @@ impl App {
             (
                 "mount + hostname".to_string(),
                 0.74,
-                format!("mount /dev/{part} /mnt; hostname={}", self.hostname),
+                format!(
+                    "mount /dev/{part} /mnt; hostname={}",
+                    sanitize_display(&self.hostname, 64)
+                ),
             ),
             (
                 "install contents".to_string(),
                 0.88,
-                format!("content list {}", self.content_list),
+                format!("content list {}", sanitize_display(&self.content_list, 256)),
             ),
             (
                 "perms + machine-id + cleanup".to_string(),
@@ -208,55 +260,113 @@ impl App {
     }
 }
 
-fn discover_disks() -> (Vec<String>, String) {
-    // Best effort on Linux; falls back to a static list so the TUI
-    // still opens for development on other OSes and in CI.
-    let raw = std::process::Command::new("lsblk")
-        .args(["-d", "-n", "-o", "NAME"])
+fn run_cleared(cmd: &str, args: &[&str]) -> Option<String> {
+    // Absolute-path binaries, cleared env, no shell. Used for read-only
+    // discovery (`lsblk`, `findmnt`, `id`) — never for destructive steps.
+    let out = std::process::Command::new(cmd)
+        .args(args)
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .env("LC_ALL", "C")
         .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_else(|| "sda sdb nvme0n1".to_string());
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8(out.stdout).ok()
+}
+
+fn first_existing(paths: &[&str], args: &[&str]) -> Option<String> {
+    for p in paths {
+        if !Path::new(p).exists() {
+            continue;
+        }
+        if let Some(out) = run_cleared(p, args) {
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn discover_disks() -> (Vec<String>, String, bool) {
+    let raw = first_existing(
+        &["/usr/bin/lsblk", "/bin/lsblk"],
+        &["-d", "-n", "-o", "NAME"],
+    )
+    .unwrap_or_else(|| "sda sdb nvme0n1".to_string());
     let disks = filter_disks(&raw);
-    let boot = boot_device().unwrap_or_else(|| "sda".to_string());
+    let (boot, known) = detect_boot_device();
+    let boot = boot.unwrap_or_default();
+    let known = known && !boot.is_empty();
     if disks.is_empty() {
-        (vec!["sda".to_string(), "sdb".to_string()], boot)
+        (Vec::new(), boot, known)
     } else {
-        (disks, boot)
+        (disks, boot, known)
     }
 }
 
-fn boot_device() -> Option<String> {
-    // 1) Labtix live marker used by exec.sh
+fn detect_boot_device() -> (Option<String>, bool) {
+    // 1) Labtix live marker used by exec.sh — strict allow-list.
     if let Ok(s) = std::fs::read_to_string("/live/config/boot-device") {
-        let dev = s.trim().trim_start_matches("/dev/").to_string();
-        if !dev.is_empty() {
-            return Some(dev);
+        let raw = s.trim();
+        let stripped = raw.strip_prefix("/dev/").unwrap_or(raw);
+        // Marker file contains e.g. "/dev/sda"; map through the same parser
+        // as findmnt so nvme/mmcblk are handled identically.
+        if let Some(disk) = disk_from_source(&format!("/dev/{stripped}")) {
+            if is_valid_disk_name(&disk) {
+                return (Some(disk), true);
+            }
         }
+        // Marker present but unparsable: fail closed (known=false).
+        return (None, false);
     }
     // 2) Device backing `/` via findmnt.
-    std::process::Command::new("findmnt")
-        .args(["-n", "-o", "SOURCE", "/"])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| {
-            let src = s.trim().to_string();
-            let base = src
-                .trim_start_matches("/dev/")
-                .trim_end_matches(|c: char| c.is_ascii_digit() || c == 'p');
-            if base.is_empty() {
-                None
-            } else {
-                Some(base.to_string())
+    if let Some(out) = first_existing(
+        &["/usr/bin/findmnt", "/bin/findmnt"],
+        &["-n", "-o", "SOURCE", "/"],
+    ) {
+        if let Some(first) = out.split_whitespace().next() {
+            if let Some(disk) = disk_from_source(first) {
+                if is_valid_disk_name(&disk) {
+                    return (Some(disk), true);
+                }
             }
-        })
+        }
+    }
+    (None, false)
+}
+
+fn is_root() -> bool {
+    // No extra deps: ask `id -u` with a cleared env.
+    if let Some(out) = first_existing(&["/usr/bin/id", "/bin/id"], &["-u"]) {
+        return out.trim() == "0";
+    }
+    false
+}
+
+fn validate_startup(cli: &Cli) -> Result<()> {
+    if !is_valid_image_name(cli.image.trim()) {
+        bail!("invalid --image (use A-Z a-z 0-9 . _ -, max 64, must not start with -)");
+    }
+    if cli.image_path.to_string_lossy().len() > 256 {
+        bail!("--image-path too long (max 256)");
+    }
+    if is_live_mode(cli) {
+        if !cfg!(target_os = "linux") {
+            bail!("--execute is Linux-only (fail-closed)");
+        }
+        if !is_root() {
+            bail!("--execute requires root (fail-closed)");
+        }
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let (disks, boot_device) = discover_disks();
-    let mut app = App::new(&cli, disks, boot_device);
+    validate_startup(&cli)?;
+    let (disks, boot_device, boot_known) = discover_disks();
+    let mut app = App::new(&cli, disks, boot_device, boot_known);
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
@@ -283,7 +393,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
         terminal.draw(|f| ui(f, app)).context("draw")?;
 
         if app.step == Step::Installing {
-            // ~80ms per frame; advance the fake-but-informative progress.
             if event::poll(Duration::from_millis(80)).context("poll")? {
                 let ev = event::read().context("read event")?;
                 if is_force_quit(&ev) {
@@ -309,12 +418,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
                 app.progress = 0.0;
                 app.progress_label = "starting…".to_string();
                 let disk = app.selected_disk().unwrap_or("?").to_string();
-                app.log(format!("installing '{}' -> /dev/{disk}", app.image));
+                app.log(format!(
+                    "installing '{}' -> /dev/{disk} [{}]",
+                    sanitize_display(&app.image, 64),
+                    if app.live { "LIVE" } else { "dry-run" }
+                ));
                 for line in build_plan(&app.image, &disk, app.shred_level, &app.hostname) {
                     app.log(format!("plan: {line}"));
                 }
-                if app.execute {
-                    app.log("WARNING: --execute given, destructive commands will run as root");
+                if app.live {
+                    app.log("LIVE: destructive steps would run now (demo build simulates)");
                 } else {
                     app.log("dry-run: no destructive command will be executed");
                 }
@@ -380,11 +493,8 @@ fn handle_key(app: &mut App, ev: &Event) -> KeyAction {
             KeyCode::Enter | KeyCode::Char('l') => {
                 if app.selected_disk().is_none() {
                     app.error = Some("no disks found".to_string());
-                } else if app.selected_is_boot() {
-                    app.error = Some(format!(
-                        "refusing: {} is the boot device",
-                        app.selected_disk().unwrap_or("?")
-                    ));
+                } else if let Some(err) = app.disk_selection_error() {
+                    app.error = Some(err);
                 } else {
                     app.step = Step::Options;
                 }
@@ -401,6 +511,11 @@ fn handle_key(app: &mut App, ev: &Event) -> KeyAction {
                     app.error = Some("invalid hostname (use A-Z a-z 0-9 -)".to_string());
                     return KeyAction::None;
                 }
+                if !is_valid_content_list_value(app.content_list.trim()) {
+                    app.error = Some("invalid content list path".to_string());
+                    return KeyAction::None;
+                }
+                app.confirm_input.clear();
                 app.step = Step::Confirm;
             }
             KeyCode::Left | KeyCode::Right => {
@@ -426,11 +541,18 @@ fn handle_key(app: &mut App, ev: &Event) -> KeyAction {
                 }
                 _ => {}
             },
+            // Input filtering: hostname `[A-Za-z0-9-]`, paths safe chars only.
             KeyCode::Char(c) => match OptionField::ALL[app.field] {
-                OptionField::Hostname if app.hostname.len() < 64 => {
+                OptionField::Hostname
+                    if app.hostname.len() < 64 && (c.is_ascii_alphanumeric() || c == '-') =>
+                {
                     app.hostname.push(c);
                 }
-                OptionField::ContentList if app.content_list.len() < 256 => {
+                OptionField::ContentList
+                    if app.content_list.len() < 256
+                        && (c.is_ascii_alphanumeric()
+                            || matches!(c, '/' | '.' | '_' | '-' | ' ')) =>
+                {
                     app.content_list.push(c);
                 }
                 _ => {}
@@ -440,7 +562,27 @@ fn handle_key(app: &mut App, ev: &Event) -> KeyAction {
         Step::Confirm => match key.code {
             KeyCode::Char('q') => return KeyAction::Quit,
             KeyCode::Esc => app.step = Step::Options,
-            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+            KeyCode::Backspace => {
+                app.confirm_input.pop();
+            }
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() && app.confirm_input.len() < 32 => {
+                app.confirm_input.push(c);
+            }
+            KeyCode::Enter => {
+                if let Some(err) = app.disk_selection_error() {
+                    app.error = Some(err);
+                    return KeyAction::None;
+                }
+                let disk = app.selected_disk().unwrap_or("?");
+                if app.confirm_input.trim() != disk {
+                    app.error = Some(format!("type '{disk}' to confirm (fail-closed)"));
+                    return KeyAction::None;
+                }
+                if app.live && !app.image_marker_ok {
+                    app.error =
+                        Some("refusing LIVE install: clonezilla-img marker missing".to_string());
+                    return KeyAction::None;
+                }
                 app.step = Step::Installing;
                 return KeyAction::StartedInstall;
             }
@@ -456,11 +598,23 @@ fn handle_key(app: &mut App, ev: &Event) -> KeyAction {
     KeyAction::None
 }
 
-/// Best-effort preview of the `####info` section from the content list,
-/// mirroring the `sed -n "/####info/,/^$/p"` block in exec.sh.
+/// Best-effort preview of the `####info` section, hardened:
+/// allow-listed path chars, regular file only, 1 MiB cap, 5 lines shown.
 fn log_content_info(app: &mut App) {
     let list_path = app.content_list.split_whitespace().next().unwrap_or("");
-    let Ok(text) = std::fs::read_to_string(list_path) else {
+    if !is_valid_content_list_value(list_path) {
+        app.log("content info: skipped (path failed allow-list)");
+        return;
+    }
+    let path = Path::new(list_path);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        app.log("content info: skipped (not a small regular file)");
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
     let info = parse_section(&text, "####info");
@@ -468,24 +622,30 @@ fn log_content_info(app: &mut App) {
         return;
     }
     for line in info.iter().take(5) {
-        app.log(format!("content info: {line}"));
+        app.log(format!("content info: {}", sanitize_display(line, 200)));
     }
 }
 
 fn advance_install(app: &mut App) {
     let stages = app.install_stages();
     app.tick += 1;
-    // One stage roughly every 25 ticks (~2s per stage).
     let idx = ((app.tick / 25) as usize).min(stages.len().saturating_sub(1));
     let (label, ratio, cmd) = &stages[idx];
     if app.progress_label != *label {
         app.progress_label = label.clone();
-        app.log(format!(">> {label}: {cmd}"));
+        app.log(format!(
+            ">> {}: {}",
+            sanitize_display(label, 64),
+            sanitize_display(cmd, 256)
+        ));
     }
     app.progress = (*ratio * 100.0).round() / 100.0;
     if app.progress >= 1.0 {
-        let disk = app.selected_disk().unwrap_or("?").to_string();
-        app.log(format!("finished: '{}' cloned to /dev/{disk}", app.image));
+        let disk = sanitize_display(app.selected_disk().unwrap_or("?"), 32);
+        app.log(format!(
+            "finished: '{}' cloned to /dev/{disk}",
+            sanitize_display(&app.image, 64)
+        ));
         app.log(format!(
             "poweroff after install: {}",
             if app.poweroff {
@@ -516,12 +676,8 @@ fn ui(f: &mut Frame, app: &App) {
         ),
         Span::raw(format!(
             "— '{}'  {}  step {}/5",
-            app.image,
-            if app.dry_run {
-                "[dry-run]"
-            } else {
-                "[EXECUTE]"
-            },
+            sanitize_display(&app.image, 64),
+            if app.live { "[LIVE]" } else { "[dry-run]" },
             match app.step {
                 Step::PickDisk => 1,
                 Step::Options => 2,
@@ -547,20 +703,23 @@ fn ui(f: &mut Frame, app: &App) {
         Step::Options => {
             "Tab move   ←/→ shred 0..3   type to edit   Space toggles poweroff   Enter confirm   Esc back"
         }
-        Step::Confirm => "Enter/y start install   Esc back   q quit",
-        Step::Installing => "installing… (q is disabled while running in this demo)",
+        Step::Confirm => "type disk name to confirm   Enter starts   Esc back   q quit",
+        Step::Installing => "installing… Ctrl-C quits",
         Step::Done => "Enter/q quit",
     };
     let mut footer_text = hint.to_string();
     if let Some(e) = &app.error {
-        footer_text = format!("ERROR: {e}  |  {hint}");
+        footer_text = format!("ERROR: {}  |  {hint}", sanitize_display(e, 200));
     }
     let footer = Paragraph::new(footer_text).block(Block::default().borders(Borders::ALL));
     f.render_widget(footer, chunks[2]);
 
     if app.error.is_some() && matches!(app.step, Step::PickDisk) {
-        let popup = Paragraph::new(app.error.clone().unwrap_or_default())
-            .block(Block::default().borders(Borders::ALL).title("Error"));
+        let popup = Paragraph::new(sanitize_display(
+            &app.error.clone().unwrap_or_default(),
+            200,
+        ))
+        .block(Block::default().borders(Borders::ALL).title("Error"));
         let popup_area = centered_rect(f.area(), 60, 20);
         f.render_widget(Clear, popup_area);
         f.render_widget(popup, popup_area);
@@ -574,9 +733,9 @@ fn render_pick_disk(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .map(|d| {
             let boot = is_boot_disk_selected(&app.boot_device, d);
             let label = if boot {
-                format!("{d}   [BOOT — do not use]")
+                format!("{}   [BOOT — do not use]", sanitize_display(d, 32))
             } else {
-                d.clone()
+                sanitize_display(d, 32)
             };
             let style = if boot {
                 Style::default().fg(Color::Red)
@@ -586,11 +745,16 @@ fn render_pick_disk(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ListItem::new(Line::from(Span::styled(label, style)))
         })
         .collect();
+    let boot_label = if app.boot_known {
+        sanitize_display(&app.boot_device, 32)
+    } else {
+        "unknown (fail-closed)".to_string()
+    };
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!("Target disk (boot: {})", app.boot_device)),
+                .title(format!("Target disk (boot: {boot_label})")),
         )
         .highlight_style(
             Style::default()
@@ -634,7 +798,7 @@ fn render_options(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     f.render_widget(
         Paragraph::new(format!(
             "Shred /dev/{} passes: {}  (3=secure, 0=no)  [←/→]",
-            app.selected_disk().unwrap_or("?"),
+            sanitize_display(app.selected_disk().unwrap_or("?"), 32),
             app.shred_level
         ))
         .style(focus(0))
@@ -642,13 +806,13 @@ fn render_options(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         rows[0],
     );
     f.render_widget(
-        Paragraph::new(app.hostname.clone())
+        Paragraph::new(sanitize_display(&app.hostname, 64))
             .style(focus(1))
             .block(box_style(1).title("2. Hostname")),
         rows[1],
     );
     f.render_widget(
-        Paragraph::new(app.content_list.clone())
+        Paragraph::new(sanitize_display(&app.content_list, 256))
             .style(focus(2))
             .block(box_style(2).title("3. Content list file")),
         rows[2],
@@ -666,10 +830,15 @@ fn render_options(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let derived = derive_paths(&app.image_path);
     f.render_widget(
         Paragraph::new(format!(
-            "image: {}\nwikis: {}\nkiwix: {}",
-            app.image_path.display(),
-            derived.content_wikis.display(),
-            derived.content_kiwix.display()
+            "image: {}\nwikis: {}\nkiwix: {}\nmarker clonezilla-img: {}",
+            sanitize_display(&app.image_path.to_string_lossy(), 256),
+            sanitize_display(&derived.content_wikis.to_string_lossy(), 256),
+            sanitize_display(&derived.content_kiwix.to_string_lossy(), 256),
+            if app.image_marker_ok {
+                "present"
+            } else {
+                "MISSING"
+            }
         ))
         .block(Block::default().borders(Borders::ALL).title("Paths"))
         .wrap(Wrap { trim: false }),
@@ -678,20 +847,42 @@ fn render_options(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_confirm(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let disk = app.selected_disk().unwrap_or("?");
-    let plan = build_plan(&app.image, disk, app.shred_level, &app.hostname);
+    let disk = sanitize_display(app.selected_disk().unwrap_or("?"), 32);
+    let plan = build_plan(&app.image, &disk, app.shred_level, &app.hostname);
+    let mode = if app.live {
+        "LIVE — destructive!"
+    } else {
+        "dry-run — nothing will run"
+    };
     let text = format!(
-        "Image '{}' will be cloned to /dev/{disk}.\nHostname: {}\nPoweroff: {}\n\n{}",
-        app.image,
-        app.hostname,
+        "Image '{}' will be cloned to /dev/{disk} ({mode}).\nHostname: {}\nPoweroff: {}\nMarker: {}\n\n{}\n\nType '{disk}' below, then Enter:",
+        sanitize_display(&app.image, 64),
+        sanitize_display(&app.hostname, 64),
         if app.poweroff { "yes" } else { "no" },
+        if app.image_marker_ok {
+            "present"
+        } else {
+            "MISSING"
+        },
         plan.join("\n"),
     );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(6), Constraint::Length(3)])
+        .split(area);
     f.render_widget(
         Paragraph::new(text)
             .block(Block::default().borders(Borders::ALL).title("Confirm"))
             .wrap(Wrap { trim: false }),
-        area,
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new(sanitize_display(&app.confirm_input, 32)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Type '{disk}' here")),
+        ),
+        rows[1],
     );
 }
 
@@ -705,7 +896,7 @@ fn render_installing(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .title(app.progress_label.clone()),
+                    .title(sanitize_display(&app.progress_label, 64)),
             )
             .gauge_style(Style::default().fg(Color::Green))
             .ratio(app.progress.clamp(0.0, 1.0)),
@@ -717,7 +908,7 @@ fn render_installing(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         .rev()
         .take(30)
         .rev()
-        .map(|l| Line::from(Span::raw(l.clone())))
+        .map(|l| Line::from(Span::raw(sanitize_display(l, 512))))
         .collect();
     f.render_widget(
         Paragraph::new(log)
@@ -728,15 +919,15 @@ fn render_installing(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 fn render_done(f: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let disk = app.selected_disk().unwrap_or("?");
+    let disk = sanitize_display(app.selected_disk().unwrap_or("?"), 32);
     let text = format!(
         "Finished! '{}' cloned to /dev/{disk}.\n\n{}",
-        app.image,
+        sanitize_display(&app.image, 64),
         app.logs
             .iter()
             .rev()
             .take(12)
-            .cloned()
+            .map(|l| sanitize_display(l, 512))
             .collect::<Vec<_>>()
             .join("\n")
     );

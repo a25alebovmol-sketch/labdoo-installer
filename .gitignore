@@ -2,3 +2,4 @@
 *.log
 /labdoo-installer
 .DS_Store
+.git/credentials
