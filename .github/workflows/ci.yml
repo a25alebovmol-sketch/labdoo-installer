@@ -55,6 +55,47 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  portable:
+    name: portable binary (debian bullseye + musl static)
+    runs-on: ubuntu-latest
+    container: debian:bullseye
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl build-essential pkg-config musl-tools && rm -rf /var/lib/apt/lists/*
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Build release (glibc baseline 2.31)
+        run: cargo build --release --locked
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Build release (musl static, max compat)
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+        env:
+          CARGO_TERM_COLOR: always
+
+      - name: Upload portable glibc artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: labdoo-installer-debian-bullseye
+          path: target/release/labdoo-installer
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload static musl artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: labdoo-installer-linux-musl-static
+          path: target/x86_64-unknown-linux-musl/release/labdoo-installer
+          if-no-files-found: error
+          retention-days: 14
+
   audit:
     name: cargo audit (known vulns)
     runs-on: ubuntu-latest
