@@ -56,9 +56,9 @@ jobs:
           retention-days: 14
 
   portable:
-    name: portable binary (debian bullseye + musl static)
+    name: portable binary (debian bookworm + musl static)
     runs-on: ubuntu-latest
-    container: debian:bullseye
+    container: debian:bookworm
     steps:
       - uses: actions/checkout@v4
 
@@ -70,7 +70,7 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
-      - name: Build release (glibc baseline 2.31)
+      - name: Build release (glibc baseline 2.36 bookworm)
         run: cargo build --release --locked
         env:
           CARGO_TERM_COLOR: always
@@ -83,7 +83,7 @@ jobs:
       - name: Upload portable glibc artifact
         uses: actions/upload-artifact@v4
         with:
-          name: labdoo-installer-debian-bullseye
+          name: labdoo-installer-debian-bookworm
           path: target/release/labdoo-installer
           if-no-files-found: error
           retention-days: 14
