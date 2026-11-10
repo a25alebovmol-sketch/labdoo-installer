@@ -34,6 +34,106 @@ use ratatui::{
 const MAX_LOG_LINES: usize = 160;
 const MAX_CONTENT_LIST_BYTES: u64 = 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserMode {
+    PickFile,
+    PickDir,
+}
+
+#[derive(Debug, Clone)]
+struct BrowserEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FileBrowser {
+    mode: BrowserMode,
+    current_dir: PathBuf,
+    entries: Vec<BrowserEntry>,
+    selected: usize,
+    error: Option<String>,
+}
+
+fn parent_of(dir: &Path) -> PathBuf {
+    dir.parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+fn sort_browser_entries(entries: &mut [BrowserEntry]) {
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
+}
+
+fn load_browser_entries(dir: &Path) -> Vec<BrowserEntry> {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for item in read_dir.flatten() {
+        let path = item.path();
+        let name = item.file_name().to_string_lossy().into_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let is_dir = item.file_type().map(|kind| kind.is_dir()).unwrap_or(false) || path.is_dir();
+        entries.push(BrowserEntry { name, path, is_dir });
+    }
+    sort_browser_entries(&mut entries);
+    entries
+}
+
+fn browser_start_dir(current_value: &str, fallback_dir: &str) -> PathBuf {
+    let trimmed = current_value.trim();
+    if !trimmed.is_empty() {
+        let path = Path::new(trimmed);
+        if path.is_dir() {
+            return path.to_path_buf();
+        }
+        if let Some(parent) = path.parent() {
+            let parent_text = parent.to_string_lossy().into_owned();
+            if !parent_text.is_empty() && Path::new(&parent_text).is_dir() {
+                return PathBuf::from(parent_text);
+            }
+        }
+    }
+    if Path::new(fallback_dir).is_dir() {
+        return PathBuf::from(fallback_dir);
+    }
+    for candidate in ["/media", "/home", "/"] {
+        if Path::new(candidate).is_dir() {
+            return PathBuf::from(candidate);
+        }
+    }
+    PathBuf::from("/")
+}
+
+fn open_browser(app: &mut App, mode: BrowserMode) {
+    let start = match mode {
+        BrowserMode::PickFile => {
+            let fallback = derive_paths(&app.image_path)
+                .content_lists
+                .to_string_lossy()
+                .into_owned();
+            browser_start_dir(&app.content_list, &fallback)
+        }
+        BrowserMode::PickDir => browser_start_dir(&app.image_path.to_string_lossy(), "/media"),
+    };
+    let entries = load_browser_entries(&start);
+    app.browser = Some(FileBrowser {
+        mode,
+        current_dir: start,
+        entries,
+        selected: 0,
+        error: None,
+    });
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "labdoo-installer",
@@ -76,6 +176,7 @@ enum Step {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OptionField {
+    Image,
     Shred,
     Hostname,
     ContentList,
@@ -83,7 +184,8 @@ enum OptionField {
 }
 
 impl OptionField {
-    const ALL: [OptionField; 4] = [
+    const ALL: [OptionField; 5] = [
+        OptionField::Image,
         OptionField::Shred,
         OptionField::Hostname,
         OptionField::ContentList,
@@ -119,6 +221,7 @@ struct App {
     error: Option<String>,
     show_help: bool,
     logs: Vec<String>,
+    browser: Option<FileBrowser>,
 }
 
 impl App {
@@ -149,6 +252,7 @@ impl App {
             error: None,
             show_help: false,
             logs: Vec::new(),
+            browser: None,
         };
         app.select_preferred_disk(None);
         app.log("SAFE PREVIEW: this build will not change any disk");
@@ -356,6 +460,10 @@ fn handle_key(app: &mut App, event: &Event) -> KeyAction {
         app.show_help = true;
         return KeyAction::None;
     }
+    if app.browser.is_some() {
+        handle_browser_key(app, key);
+        return KeyAction::None;
+    }
     app.error = None;
 
     match app.step {
@@ -390,44 +498,42 @@ fn handle_key(app: &mut App, event: &Event) -> KeyAction {
             KeyCode::Char(' ') if OptionField::ALL[app.field] == OptionField::Poweroff => {
                 app.poweroff = !app.poweroff;
             }
-            KeyCode::Backspace => match OptionField::ALL[app.field] {
-                OptionField::Hostname => {
-                    app.hostname.pop();
-                }
-                OptionField::ContentList => {
-                    app.content_list.pop();
-                }
-                _ => {}
-            },
-            KeyCode::Char(character) => match OptionField::ALL[app.field] {
-                OptionField::Hostname
-                    if app.hostname.len() < 63
-                        && (character.is_ascii_alphanumeric() || character == '-') =>
-                {
-                    app.hostname.push(character);
-                }
-                OptionField::ContentList
-                    if app.content_list.len() < 256
-                        && (character.is_ascii_alphanumeric()
-                            || matches!(character, '/' | '.' | '_' | '-' | ' ')) =>
-                {
-                    app.content_list.push(character);
-                }
-                _ => {}
-            },
-            KeyCode::Enter => {
-                if !validate_hostname(&app.hostname) {
-                    app.error = Some(
-                        "invalid hostname: use A-Z, 0-9 and hyphens; no leading/trailing hyphen"
-                            .to_string(),
-                    );
-                } else if !is_valid_content_list_value(app.content_list.trim()) {
-                    app.error = Some("content list must be an absolute safe path".to_string());
-                } else {
-                    app.confirm_input.clear();
-                    app.step = Step::Confirm;
-                }
+            KeyCode::Backspace if OptionField::ALL[app.field] == OptionField::Hostname => {
+                app.hostname.pop();
             }
+            KeyCode::Char(character)
+                if OptionField::ALL[app.field] == OptionField::Hostname
+                    && app.hostname.len() < 63
+                    && (character.is_ascii_alphanumeric() || character == '-') =>
+            {
+                app.hostname.push(character);
+            }
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if matches!(
+                    OptionField::ALL[app.field],
+                    OptionField::Image | OptionField::ContentList
+                ) =>
+            {
+                let mode = if OptionField::ALL[app.field] == OptionField::Image {
+                    BrowserMode::PickDir
+                } else {
+                    BrowserMode::PickFile
+                };
+                open_browser(app, mode);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                try_advance_options(app);
+            }
+            KeyCode::Enter => match OptionField::ALL[app.field] {
+                OptionField::Image => open_browser(app, BrowserMode::PickDir),
+                OptionField::ContentList => open_browser(app, BrowserMode::PickFile),
+                OptionField::Poweroff => {
+                    app.poweroff = !app.poweroff;
+                }
+                _ => {
+                    try_advance_options(app);
+                }
+            },
             _ => {}
         },
         Step::Confirm => match key.code {
@@ -476,6 +582,156 @@ fn handle_key(app: &mut App, event: &Event) -> KeyAction {
         },
     }
     KeyAction::None
+}
+
+fn try_advance_options(app: &mut App) {
+    if !validate_hostname(&app.hostname) {
+        app.error = Some(
+            "invalid hostname: use A-Z, 0-9 and hyphens; no leading/trailing hyphen".to_string(),
+        );
+        return;
+    }
+    if !is_valid_content_list_value(app.content_list.trim()) {
+        app.error = Some(
+            "content list must be an absolute safe path; press Enter on that field to browse"
+                .to_string(),
+        );
+        return;
+    }
+    if !is_absolute_image_path(&app.image_path) || app.image_path.to_string_lossy().len() > 256 {
+        app.error = Some(
+            "image directory must be an absolute path; press Enter on that field to browse"
+                .to_string(),
+        );
+        return;
+    }
+    app.confirm_input.clear();
+    app.step = Step::Confirm;
+}
+
+#[allow(clippy::needless_return)]
+fn handle_browser_key(app: &mut App, key: &crossterm::event::KeyEvent) {
+    let Some(browser) = app.browser.as_mut() else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.browser = None;
+            return;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if !browser.entries.is_empty() {
+                if browser.selected == 0 {
+                    browser.selected = browser.entries.len() - 1;
+                } else {
+                    browser.selected -= 1;
+                }
+            }
+            return;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !browser.entries.is_empty() {
+                browser.selected = (browser.selected + 1) % browser.entries.len();
+            }
+            return;
+        }
+        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+            let parent = parent_of(&browser.current_dir.clone());
+            if parent != browser.current_dir {
+                browser.current_dir = parent;
+                browser.entries = load_browser_entries(&browser.current_dir);
+                browser.selected = 0;
+                browser.error = None;
+            }
+            return;
+        }
+        KeyCode::Char('/') => {
+            browser.current_dir = PathBuf::from("/");
+            browser.entries = load_browser_entries(&browser.current_dir);
+            browser.selected = 0;
+            browser.error = None;
+            return;
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            let candidate = PathBuf::from("/media");
+            if candidate.is_dir() {
+                browser.current_dir = candidate;
+                browser.entries = load_browser_entries(&browser.current_dir);
+                browser.selected = 0;
+                browser.error = None;
+            } else {
+                browser.error = Some("/media is not available".to_string());
+            }
+            return;
+        }
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            let candidate = PathBuf::from("/home");
+            if candidate.is_dir() {
+                browser.current_dir = candidate;
+                browser.entries = load_browser_entries(&browser.current_dir);
+                browser.selected = 0;
+                browser.error = None;
+            } else {
+                browser.error = Some("/home is not available".to_string());
+            }
+            return;
+        }
+        KeyCode::Char('s') | KeyCode::Char('S') if browser.mode == BrowserMode::PickDir => {
+            let chosen = browser.current_dir.clone();
+            let text = chosen.to_string_lossy().into_owned();
+            if text.len() > 256 || !text.starts_with('/') {
+                browser.error = Some("that directory path is not usable".to_string());
+                return;
+            }
+            app.image_path = chosen;
+            app.image_marker_ok = clonezilla_marker_path(&app.image_path).is_file();
+            let suggested = derive_paths(&app.image_path)
+                .content_lists
+                .join("none")
+                .to_string_lossy()
+                .into_owned();
+            app.content_list = suggested;
+            app.browser = None;
+            app.log(format!(
+                "image directory selected: {}",
+                app.image_path.display()
+            ));
+            if !app.image_marker_ok {
+                app.log("warning: clonezilla-img marker is missing from the image directory");
+            }
+            return;
+        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+            let Some(entry) = browser.entries.get(browser.selected).cloned() else {
+                browser.error = Some("this folder is empty; press Backspace to go up".to_string());
+                return;
+            };
+            if entry.is_dir {
+                browser.current_dir = entry.path;
+                browser.entries = load_browser_entries(&browser.current_dir);
+                browser.selected = 0;
+                browser.error = None;
+                return;
+            }
+            if browser.mode == BrowserMode::PickDir {
+                browser.error = Some(
+                    "that is a file; open a folder or press s to use the current folder"
+                        .to_string(),
+                );
+                return;
+            }
+            let text = entry.path.to_string_lossy().into_owned();
+            if !is_valid_content_list_value(text.trim()) {
+                browser.error = Some("that file name contains unsupported characters".to_string());
+                return;
+            }
+            app.content_list = text.clone();
+            app.browser = None;
+            app.log(format!("content list selected: {text}"));
+            return;
+        }
+        _ => {}
+    }
 }
 
 fn move_disk_selection(app: &mut App, forward: bool) {
@@ -614,7 +870,9 @@ fn ui(frame: &mut Frame, app: &App) {
     }
     render_footer(frame, app, layout[2]);
 
-    if let Some(error) = &app.error {
+    if let Some(browser) = &app.browser {
+        render_browser(frame, browser);
+    } else if let Some(error) = &app.error {
         render_popup(frame, "Safety check", error, Color::Red);
     } else if app.show_help {
         render_popup(frame, "Help", &help_text(app.step), Color::Cyan);
@@ -646,9 +904,18 @@ fn render_title(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
+    if app.browser.is_some() {
+        frame.render_widget(
+            Paragraph::new("↑/↓ move  Enter open/select  Backspace up  / root  m media  o home  s use folder  Esc close").block(Block::default().borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
     let hint = match app.step {
-        Step::PickDisk => "↑/↓ select  Enter next  r refresh  ? help  q quit",
-        Step::Options => "Tab move  ←/→ shred  Space toggle  Enter next  Esc back  ? help",
+        Step::PickDisk => "Up/Down select  Enter next  r refresh  ? help  q quit",
+        Step::Options => {
+            "Tab move  Enter browse/select  n continue  <-/-> shred  Space toggle  Esc back  ? help"
+        }
         Step::Confirm => "type the disk name  Enter review plan  Esc back  ? help",
         Step::Plan => "Esc back  r refresh  q quit  ? help",
     };
@@ -748,7 +1015,8 @@ fn render_options(frame: &mut Frame, app: &App, area: Rect) {
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
-            Constraint::Min(4),
+            Constraint::Length(3),
+            Constraint::Min(3),
         ])
         .split(area);
     let focus = |index: usize| {
@@ -775,24 +1043,39 @@ fn render_options(frame: &mut Frame, app: &App, area: Rect) {
         .unwrap_or("?");
     frame.render_widget(
         Paragraph::new(format!(
-            "Passes for /dev/{target}: {}  (0 = no overwrite, 3 = strongest legacy setting)",
-            app.shred_level
+            "{}  [Enter: browse folders]",
+            sanitize_display(&app.image_path.to_string_lossy(), 180)
         ))
         .style(focus(0))
-        .block(block(0, "1. Shred")),
+        .block(block(0, "1. Image folder (Clonezilla directory)"))
+        .wrap(Wrap { trim: false }),
         rows[0],
     );
     frame.render_widget(
-        Paragraph::new(sanitize_display(&app.hostname, 63))
-            .style(focus(1))
-            .block(block(1, "2. Hostname")),
+        Paragraph::new(format!(
+            "Passes for /dev/{target}: {}  (0 = no overwrite, 3 = strongest legacy setting)",
+            app.shred_level
+        ))
+        .style(focus(1))
+        .block(block(1, "2. Shred")),
         rows[1],
     );
     frame.render_widget(
-        Paragraph::new(sanitize_display(&app.content_list, 256))
+        Paragraph::new(sanitize_display(&app.hostname, 63))
             .style(focus(2))
-            .block(block(2, "3. Content-list file")),
+            .block(block(2, "3. Hostname (type it)"))
+            .wrap(Wrap { trim: false }),
         rows[2],
+    );
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{}  [Enter: browse files]",
+            sanitize_display(&app.content_list, 180)
+        ))
+        .style(focus(3))
+        .block(block(3, "4. Content-list file (pick it, no typing needed)"))
+        .wrap(Wrap { trim: false }),
+        rows[3],
     );
     frame.render_widget(
         Paragraph::new(if app.poweroff {
@@ -800,27 +1083,30 @@ fn render_options(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             "[ ] power off after a future installation  [Space]"
         })
-        .style(focus(3))
-        .block(block(3, "4. After install")),
-        rows[3],
+        .style(focus(4))
+        .block(block(4, "5. After install")),
+        rows[4],
     );
 
     let paths = derive_paths(&app.image_path);
     let marker = if app.image_marker_ok {
         "present"
     } else {
-        "MISSING"
+        "MISSING - pick the folder that contains clonezilla-img"
     };
     frame.render_widget(
         Paragraph::new(format!(
-            "Image directory: {}\nMarker clonezilla-img: {marker}\nWiki archive: {}\nKiwix archive: {}",
-            sanitize_display(&app.image_path.to_string_lossy(), 180),
-            sanitize_display(&paths.content_wikis.to_string_lossy(), 180),
-            sanitize_display(&paths.content_kiwix.to_string_lossy(), 180),
+            "Marker clonezilla-img: {marker} | Wiki: {} | Kiwix: {} | Press n when ready.",
+            sanitize_display(&paths.content_wikis.to_string_lossy(), 90),
+            sanitize_display(&paths.content_kiwix.to_string_lossy(), 90),
         ))
-        .block(Block::default().borders(Borders::ALL).title("Preflight paths"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Preflight paths"),
+        )
         .wrap(Wrap { trim: false }),
-        rows[4],
+        rows[5],
     );
 }
 
@@ -913,10 +1199,104 @@ fn render_popup(frame: &mut Frame, title: &str, text: &str, color: Color) {
     );
 }
 
+fn render_browser(frame: &mut Frame, browser: &FileBrowser) {
+    let area = centered_rect(frame.area(), 84, 76);
+    frame.render_widget(Clear, area);
+    let title = match browser.mode {
+        BrowserMode::PickFile => "Pick a content-list file",
+        BrowserMode::PickDir => "Pick the Clonezilla image folder",
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(5),
+            Constraint::Length(5),
+        ])
+        .split(area);
+    frame.render_widget(
+        Paragraph::new(sanitize_display(
+            &browser.current_dir.to_string_lossy(),
+            220,
+        ))
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+    let items: Vec<ListItem> = browser
+        .entries
+        .iter()
+        .map(|entry| {
+            let label = if entry.is_dir {
+                format!("[folder] {}", entry.name)
+            } else {
+                format!("[file]   {}", entry.name)
+            };
+            let style = if entry.is_dir {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::from(Span::styled(label, style)))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !browser.entries.is_empty() {
+        state.select(Some(browser.selected.min(browser.entries.len() - 1)));
+    }
+    let list_block = Block::default().borders(Borders::ALL).title(format!(
+        "{} entries - Up/Down moves, Enter opens or picks a file",
+        browser.entries.len()
+    ));
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("This folder is empty. Press Backspace to go up.").block(list_block),
+            chunks[1],
+        );
+    } else {
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(list_block)
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> "),
+            chunks[1],
+            &mut state,
+        );
+    }
+    let help = match browser.mode {
+        BrowserMode::PickFile => {
+            let err = browser
+                .error
+                .as_deref()
+                .map(|e| format!("\nError: {e}"))
+                .unwrap_or_default();
+            format!("Enter: open folder / pick file{err}\nBackspace: parent folder | / root | m media | o home | Esc cancel")
+        }
+        BrowserMode::PickDir => {
+            let err = browser
+                .error
+                .as_deref()
+                .map(|e| format!("\nError: {e}"))
+                .unwrap_or_default();
+            format!("Enter: open folder | s: USE this folder as image{err}\nBackspace: parent folder | / root | m media | o home | Esc cancel")
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(help)
+            .block(Block::default().borders(Borders::ALL).title("How to pick"))
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+}
+
 fn help_text(step: Step) -> String {
     let context = match step {
         Step::PickDisk => "Use r after attaching a disk or changing VMware hardware.",
-        Step::Options => "Only safe hostname and absolute content-list values are accepted.",
+        Step::Options => "No typing needed: press Enter on the image folder and on the content-list file to pick them visually. Press n to continue.",
         Step::Confirm => "Typing the target protects against an accidental selection.",
         Step::Plan => "This screen is a review, not a completed installation.",
     };
@@ -1032,5 +1412,66 @@ mod tests {
             app.selected_disk().map(|disk| disk.name.as_str()),
             Some("sdb")
         );
+    }
+
+    #[test]
+    fn browser_entries_sort_folders_first() {
+        let mut entries = vec![
+            BrowserEntry {
+                name: "zeta.txt".to_string(),
+                path: PathBuf::from("/tmp/zeta.txt"),
+                is_dir: false,
+            },
+            BrowserEntry {
+                name: "alpha".to_string(),
+                path: PathBuf::from("/tmp/alpha"),
+                is_dir: true,
+            },
+            BrowserEntry {
+                name: "Beta".to_string(),
+                path: PathBuf::from("/tmp/Beta"),
+                is_dir: true,
+            },
+            BrowserEntry {
+                name: "apple.txt".to_string(),
+                path: PathBuf::from("/tmp/apple.txt"),
+                is_dir: false,
+            },
+        ];
+        sort_browser_entries(&mut entries);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "Beta", "apple.txt", "zeta.txt"]);
+    }
+
+    #[test]
+    fn browser_parent_never_escapes_root() {
+        assert_eq!(parent_of(Path::new("/")), PathBuf::from("/"));
+        assert_eq!(parent_of(Path::new("/media/usb")), PathBuf::from("/media"));
+    }
+
+    #[test]
+    fn options_continue_validates_browsed_paths() {
+        let cli = Cli {
+            image: "labdoo".to_string(),
+            image_path: PathBuf::from("/tmp/labdoo"),
+            dry_run: true,
+            execute: false,
+        };
+        let discovery = Discovery {
+            disks: Vec::new(),
+            boot_device: None,
+            boot_source: None,
+            notes: Vec::new(),
+        };
+        let mut app = App::new(&cli, discovery);
+        app.step = Step::Options;
+        app.hostname = KEEP_HOSTNAME.to_string();
+        // Content list comes from the browser, so it is always absolute.
+        app.content_list = "/media/usb/wiki-archive/content_list/none".to_string();
+        assert!(is_valid_content_list_value(app.content_list.trim()));
+        try_advance_options(&mut app);
+        // Blocked only because boot info is unknown in this fixture is checked later;
+        // options validation itself must pass.
+        assert!(app.error.is_none());
     }
 }

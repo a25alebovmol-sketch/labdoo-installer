@@ -24,7 +24,8 @@ option instead of making that claim.
   screen.
 - Supports refresh with r, which is useful after changing VMware hardware.
 - Requires the target name to be typed exactly before showing the plan.
-- Validates absolute content-list paths and stricter hostnames.
+- Replaces manual content-list typing with a visual file browser; the image folder is also picked visually.
+- Validates browsed absolute content-list paths and stricter hostnames.
 - Correctly handles content-list paths that contain spaces.
 - Replaces the fake progress/success screen with an explicit reviewed plan.
 - Adds unit tests for VMware optical boot, metadata parsing, boot protection,
@@ -45,12 +46,24 @@ Keys:
 
 - Up/Down: choose a target disk
 - r: refresh block-device and boot-media detection
-- Tab: switch option fields
+- Tab / Up / Down: move between option fields
+- Enter on the image folder or content-list file: open the visual file browser (no typing needed)
+- n: continue when all options are ready
 - Left/Right: change shred passes
 - Space: toggle the future power-off preference
 - ? or h: show safety help
-- Esc: go back
+- Esc: go back / close the browser
 - q or Ctrl-C: quit
+
+File browser:
+
+- Up/Down: move in the folder list
+- Enter or Right: open a folder, or pick the highlighted file
+- Backspace or Left: go to the parent folder
+- /: go to the root folder, m: go to /media, o: go to /home
+- s (image browser only): use the current folder as the Clonezilla image folder
+- Esc: close without changing anything
+- Folders are shown first as [folder], files as [file]. Manual path typing is gone.
 
 ## VMware behaviour
 
